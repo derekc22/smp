@@ -1,9 +1,10 @@
-"""Minimal G1 base-height + SMP guidance env config.
+"""Shared G1 + SMP guidance env config.
 
 Uses the stock ``ManagerBasedRlEnv`` — the SMP feature buffer and frozen
 denoiser are attached via startup/reset events in ``smp.rl.events`` so this
 task can be registered with ``mjlab.tasks.registry`` and run through
-``mjlab-train`` / ``mjlab-play``.
+``mjlab-train`` / ``mjlab-play``.  Per-task configs (e.g. steering) extend
+this with task-specific commands, observations, and rewards.
 """
 
 from __future__ import annotations
@@ -23,23 +24,28 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.scene import SceneCfg
+from mjlab.sensor.contact_sensor import ContactMatch, ContactSensorCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
+from mjlab.tasks.velocity.mdp import illegal_contact
 from mjlab.terrains import TerrainEntityCfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
-from smp.rl.events import gsi_reset, init_smp_state
+from smp.rl.events import (
+  gsi_reset,
+  init_smp_state,
+)
 from smp.rl.rewards import (
   smp_guidance_reward,
 )
 
 
 def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-  """Build the G1 base-height env cfg.
+  """Build the shared G1 + SMP env cfg.
 
   The pretrained SMP denoiser checkpoint path is hardcoded on the
-  ``init_smp_state`` event below — edit it there if you want a different
-  checkpoint.
+  ``init_smp_state`` event below — override it from the task config if you
+  want a different checkpoint.
   """
 
   # --- Observations --------------------------------------------------------
@@ -107,7 +113,7 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       mode="startup",
       params={"ckpt_path": "logs/pretrain/pretrained.pt"},
     ),
-    "gsi_reset": EventTermCfg(func=gsi_reset, mode="reset"),
+    "gsi_reset": EventTermCfg(func=gsi_reset, mode="reset", params={}),
     "push_robot": EventTermCfg(
       func=mdp.push_by_setting_velocity,
       mode="interval",
@@ -162,17 +168,31 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   rewards: dict[str, RewardTermCfg] = {
     "smp_guidance": RewardTermCfg(
       func=smp_guidance_reward,
-      weight=4.0,
+      weight=1.0,
       params={
         "fixed_timesteps": (8, 15, 22),
-        "ws": 4.0,
+        "ws": 2.0,
       },
     ),
   }
 
+  # --- Sensors -------------------------------------------------------------
+  self_collision_cfg = ContactSensorCfg(
+    name="self_collision",
+    primary=ContactMatch(mode="subtree", pattern="pelvis", entity="robot"),
+    secondary=ContactMatch(mode="subtree", pattern="pelvis", entity="robot"),
+    fields=("found",),
+    reduce="none",
+    num_slots=1,
+  )
+
   # --- Terminations --------------------------------------------------------
   terminations = {
     "time_out": TerminationTermCfg(func=time_out, time_out=True),
+    "self_collision": TerminationTermCfg(
+      func=illegal_contact,
+      params={"sensor_name": self_collision_cfg.name},
+    ),
   }
 
   cfg = ManagerBasedRlEnvCfg(
@@ -181,6 +201,7 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       entities={"robot": get_g1_robot_cfg()},
       num_envs=1,
       extent=2.0,
+      sensors=(self_collision_cfg,),
     ),
     observations=observations,
     actions=actions,

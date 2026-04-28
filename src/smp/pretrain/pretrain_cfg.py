@@ -17,18 +17,18 @@ class PretrainCfg:
   """Path to q01/q99 quantile stats from compute_norm_stats.py."""
   train_split: float = 0.9
 
-  # Model
+  # Model. ``d_model = nhead · head_dim`` is the DiT inner dim; FF inner
+  # dim is fixed at 4·d_model.
   d_model: int = 256
-  nhead: int = 8
-  num_layers: int = 4
-  dim_feedforward: int = 1024
-  dropout: float = 0.1
+  nhead: int = 4
+  num_layers: int = 2
+  dropout: float = 0.0
 
   # Diffusion
   num_timesteps: int = 50
 
   # EMA
-  use_ema: bool = True
+  use_ema: bool = False
   ema_decay: float = 0.9999
 
   # Training

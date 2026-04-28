@@ -1,8 +1,4 @@
-"""Utilities for SMP RL: denoiser loader, diff-normalizer, and feature buffer.
-
-Grouped in one module for a cleaner package layout.  All of these are used
-by the SMP guidance reward and the associated startup/reset events.
-"""
+"""Utilities for SMP RL: denoiser loader, diff-normalizer, and feature buffer."""
 
 from __future__ import annotations
 
@@ -13,16 +9,13 @@ import torch
 from mjlab.utils.lab_api.math import (
   matrix_from_quat,
   quat_apply_inverse,
-  subtract_frame_transforms,
+  quat_conjugate,
+  quat_mul,
   yaw_quat,
 )
 
 from smp.pretrain.model import DiffusionDenoiser
 from smp.pretrain.scheduler import DDPMScheduler
-
-# =============================================================================
-# Denoiser loader
-# =============================================================================
 
 
 def load_denoiser(
@@ -46,7 +39,6 @@ def load_denoiser(
     d_model=int(cfg.get("d_model", 256)),
     nhead=int(cfg.get("nhead", 8)),
     num_layers=int(cfg.get("num_layers", 2)),
-    dim_feedforward=int(cfg.get("dim_feedforward", 1024)),
     dropout=float(cfg.get("dropout", 0.0)),
   ).to(device)
   state = ckpt.get("model_ema") or ckpt["model"]
@@ -64,18 +56,12 @@ def load_denoiser(
   return model, scheduler, q_low, q_high, feature_dim, window_size
 
 
-# =============================================================================
-# Diff-normalizer (MimicKit style)
-# =============================================================================
-
-
 class DiffNormalizer:
   """Count-based running mean, one scalar per diffusion timestep.
 
-  Equal weighting across all observed samples (mirrors MimicKit's
-  ``DiffNormalizer``) so the normalizer naturally freezes as the sample
-  count grows, giving a stable reference scale for SDS MSE values instead
-  of a moving EMA target that drifts with the policy.
+  Equal weighting across all observed samples — the normalizer naturally
+  freezes as the sample count grows, giving a stable reference scale for
+  SDS MSE values instead of a moving EMA target that drifts with the policy.
   """
 
   def __init__(
@@ -111,18 +97,19 @@ class DiffNormalizer:
     return mse_per_env / self.mean[t].clamp(min=self.min_value)
 
 
-# =============================================================================
-# Pelvis-anchored rolling feature buffer
-# =============================================================================
+class MotionFeatureBuffer:
+  """Rolling per-env buffer producing AMP-aligned motion features.
 
+  Stores the last ``window_size`` raw world-frame kinematic samples per env
+  and, on ``compute_features()``, returns a window anchored at the LAST frame's
+  yaw-only local frame with the per-frame layout:
 
-class PelvisAnchoredFeatureBuffer:
-  """Per-env rolling buffer of (root_pos_w, root_quat_w, root_lin_vel_w,
-  root_ang_vel_w, joint_pos, joint_vel).
+      ``[root_pos(3), root_rot(6), joint_pos(J), ee_pos(E*3),
+         root_lin_vel(3), root_ang_vel(3)]``
 
-  Calling :meth:`compute_features` produces tensors with the same layout as
-  the offline NPZ ``windows`` rows: ``[anchor_pos_b(3), anchor_ori_6d(6),
-  base_lin_vel_b(3), base_ang_vel_b(3), joint_pos(J), joint_vel(J)]``.
+  Matches ``scripts/csv_to_npz.py``.  ``joint_vel`` is stored internally so
+  the API stays symmetric with sim observations, but is NOT part of the
+  feature output.
   """
 
   def __init__(
@@ -130,11 +117,13 @@ class PelvisAnchoredFeatureBuffer:
     num_envs: int,
     window_size: int,
     num_joints: int,
+    num_ee: int,
     device: torch.device | str,
   ) -> None:
     self.num_envs = num_envs
     self.window_size = window_size
     self.num_joints = num_joints
+    self.num_ee = num_ee
     self.device = torch.device(device)
 
     self.root_pos_w = torch.zeros(num_envs, window_size, 3, device=self.device)
@@ -142,6 +131,7 @@ class PelvisAnchoredFeatureBuffer:
     self.root_quat_w[..., 0] = 1.0
     self.root_lin_vel_w = torch.zeros(num_envs, window_size, 3, device=self.device)
     self.root_ang_vel_w = torch.zeros(num_envs, window_size, 3, device=self.device)
+    self.ee_pos_w = torch.zeros(num_envs, window_size, num_ee, 3, device=self.device)
     self.joint_pos = torch.zeros(num_envs, window_size, num_joints, device=self.device)
     self.joint_vel = torch.zeros(num_envs, window_size, num_joints, device=self.device)
 
@@ -152,16 +142,18 @@ class PelvisAnchoredFeatureBuffer:
     root_quat_w: torch.Tensor,
     root_lin_vel_w: torch.Tensor,
     root_ang_vel_w: torch.Tensor,
+    ee_pos_w: torch.Tensor,
     joint_pos: torch.Tensor,
     joint_vel: torch.Tensor,
   ) -> None:
-    """Fill all W slots of ``env_ids`` with the given current observation."""
+    """Fill all W slots of ``env_ids`` with a pre-sampled trajectory."""
     if env_ids.numel() == 0:
       return
     self.root_pos_w[env_ids] = root_pos_w
     self.root_quat_w[env_ids] = root_quat_w
     self.root_lin_vel_w[env_ids] = root_lin_vel_w
     self.root_ang_vel_w[env_ids] = root_ang_vel_w
+    self.ee_pos_w[env_ids] = ee_pos_w
     self.joint_pos[env_ids] = joint_pos
     self.joint_vel[env_ids] = joint_vel
 
@@ -171,6 +163,7 @@ class PelvisAnchoredFeatureBuffer:
     root_quat_w: torch.Tensor,
     root_lin_vel_w: torch.Tensor,
     root_ang_vel_w: torch.Tensor,
+    ee_pos_w: torch.Tensor,
     joint_pos: torch.Tensor,
     joint_vel: torch.Tensor,
   ) -> None:
@@ -179,57 +172,72 @@ class PelvisAnchoredFeatureBuffer:
     self.root_quat_w = torch.roll(self.root_quat_w, shifts=-1, dims=1)
     self.root_lin_vel_w = torch.roll(self.root_lin_vel_w, shifts=-1, dims=1)
     self.root_ang_vel_w = torch.roll(self.root_ang_vel_w, shifts=-1, dims=1)
+    self.ee_pos_w = torch.roll(self.ee_pos_w, shifts=-1, dims=1)
     self.joint_pos = torch.roll(self.joint_pos, shifts=-1, dims=1)
     self.joint_vel = torch.roll(self.joint_vel, shifts=-1, dims=1)
     self.root_pos_w[:, -1] = root_pos_w
     self.root_quat_w[:, -1] = root_quat_w
     self.root_lin_vel_w[:, -1] = root_lin_vel_w
     self.root_ang_vel_w[:, -1] = root_ang_vel_w
+    self.ee_pos_w[:, -1] = ee_pos_w
     self.joint_pos[:, -1] = joint_pos
     self.joint_vel[:, -1] = joint_vel
 
   def compute_features(self) -> torch.Tensor:
-    """Return (num_envs, window_size, 3+6+3+3+J+J) features.
+    """Return motion features ``(num_envs, W, 3+6+J+E*3+3+3)``.
 
-    Layout (matches ``scripts/csv_to_npz.py::_compute_windows``):
-      [0:3]         motion_anchor_pos_b   anchor at frame t in frame-0 yaw frame
-      [3:9]         motion_anchor_ori_b   first 2 cols of rotation matrix (6D)
-      [9:12]        base_lin_vel_b        linear velocity in frame-0 yaw frame
-      [12:15]       base_ang_vel_b        angular velocity in frame-0 yaw frame
-      [15:15+J]     joint_pos             raw joint positions
-      [15+J:15+2J]  joint_vel             raw joint velocities
+    All spatial quantities anchored to the LAST window frame's yaw-only local
+    frame.  See the class docstring for the layout.
     """
     N = self.num_envs
     W = self.window_size
+    E = self.num_ee
 
-    anchor_pos_t = self.root_pos_w  # (N, W, 3)
-    anchor_quat_t = self.root_quat_w  # (N, W, 4)
-    anchor_pos_0 = anchor_pos_t[:, 0:1, :].expand(N, W, 3).clone()
-    anchor_pos_0[..., 2] = 0.0
-    anchor_quat_0: torch.Tensor = yaw_quat(anchor_quat_t[:, 0])[:, None, :].expand(
-      N, W, 4
+    anchor_pos_T = self.root_pos_w[:, -1]
+    anchor_quat_T = self.root_quat_w[:, -1]
+    yaw_T = yaw_quat(anchor_quat_T)
+    heading_inv_T = quat_conjugate(yaw_T)
+    heading_inv_T_W = heading_inv_T[:, None, :].expand(N, W, 4)
+    yaw_T_W = yaw_T[:, None, :].expand(N, W, 4).reshape(-1, 4)
+
+    root_offset = self.root_pos_w - anchor_pos_T[:, None, :]
+    root_pos_local = quat_apply_inverse(yaw_T_W, root_offset.reshape(-1, 3)).reshape(
+      N, W, 3
+    )
+    root_pos_local = root_pos_local.clone()
+    root_pos_local[..., 2] = self.root_pos_w[..., 2]
+
+    # 6D rot is stacked [col0, col2] = [rotated-x-axis, rotated-z-axis].
+    root_rot_local_quat = quat_mul(
+      heading_inv_T_W.reshape(-1, 4),
+      self.root_quat_w.reshape(-1, 4),
+    ).reshape(N, W, 4)
+    root_rot_mat = matrix_from_quat(root_rot_local_quat.reshape(-1, 4)).reshape(
+      N, W, 3, 3
+    )
+    root_rot_6d = torch.cat([root_rot_mat[..., :, 0], root_rot_mat[..., :, 2]], dim=-1)
+
+    ee_offset_w = self.ee_pos_w - self.root_pos_w[:, :, None, :]
+    yaw_T_E = yaw_T[:, None, None, :].expand(N, W, E, 4).reshape(-1, 4)
+    ee_pos_local = quat_apply_inverse(yaw_T_E, ee_offset_w.reshape(-1, 3)).reshape(
+      N, W, E * 3
     )
 
-    m_pos, m_quat = subtract_frame_transforms(
-      anchor_pos_0.reshape(-1, 3),
-      anchor_quat_0.reshape(-1, 4),
-      anchor_pos_t.reshape(-1, 3),
-      anchor_quat_t.reshape(-1, 4),
-    )
-    m_pos = m_pos.reshape(N, W, 3)
-    m_ori_6d = matrix_from_quat(m_quat)[..., :2].reshape(N, W, 6)
-
-    # Velocities in frame-0 yaw frame.
-    lin_vel_b = quat_apply_inverse(
-      anchor_quat_0.reshape(-1, 4),
-      self.root_lin_vel_w.reshape(-1, 3),
+    lin_vel_local = quat_apply_inverse(
+      yaw_T_W, self.root_lin_vel_w.reshape(-1, 3)
     ).reshape(N, W, 3)
-    ang_vel_b = quat_apply_inverse(
-      anchor_quat_0.reshape(-1, 4),
-      self.root_ang_vel_w.reshape(-1, 3),
+    ang_vel_local = quat_apply_inverse(
+      yaw_T_W, self.root_ang_vel_w.reshape(-1, 3)
     ).reshape(N, W, 3)
 
     return torch.cat(
-      [m_pos, m_ori_6d, lin_vel_b, ang_vel_b, self.joint_pos, self.joint_vel],
+      [
+        root_pos_local,
+        root_rot_6d,
+        self.joint_pos,
+        ee_pos_local,
+        lin_vel_local,
+        ang_vel_local,
+      ],
       dim=-1,
     )

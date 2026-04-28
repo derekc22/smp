@@ -65,7 +65,7 @@ class MotionWindowDataset(Dataset[torch.Tensor]):
       if tiny.any():
         self.q_high[tiny] = self.q_low[tiny] + 1.0
 
-    # Normalize to ~[-1, 1] (no clamp — outliers beyond q01/q99 are kept).
+    # Normalize
     data = 2.0 * (data - self.q_low) / (self.q_high - self.q_low) - 1.0
 
     self.windows = torch.from_numpy(data)

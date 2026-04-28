@@ -51,7 +51,7 @@ def _diffusion_loss(
   x_0: torch.Tensor,
   num_noise_samples: int = 10,
 ) -> torch.Tensor:
-  """DDPM epsilon-prediction loss with multiple noise samples per data point.
+  """DDPM ε-prediction L1 loss with multiple noise samples per data point.
 
   Each sample in the batch is paired with ``num_noise_samples`` random
   (timestep, noise) draws, giving lower-variance gradients than a single
@@ -64,7 +64,7 @@ def _diffusion_loss(
   t = scheduler.sample_timesteps(B * K, x_0.device)
   noise = torch.randn_like(x_0_exp)
   x_t = scheduler.add_noise(x_0_exp, noise, t)
-  return F.mse_loss(model(x_t, t), noise)
+  return F.l1_loss(model(x_t, t), noise)
 
 
 def _save_checkpoint(
@@ -130,7 +130,6 @@ def pretrain(cfg: PretrainCfg) -> Path:
     d_model=cfg.d_model,
     nhead=cfg.nhead,
     num_layers=cfg.num_layers,
-    dim_feedforward=cfg.dim_feedforward,
     dropout=cfg.dropout,
   ).to(device)
   scheduler = DDPMScheduler(

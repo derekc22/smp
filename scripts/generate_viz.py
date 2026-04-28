@@ -1,5 +1,15 @@
 """Unconditionally generate a motion window with a trained SMP diffusion model
-and visualize the predicted trajectory in a viser viewer."""
+and visualize the predicted trajectory in a viser viewer.
+
+Features carry ``root_pos`` (xy heading-inv + world z) and ``root_rot``
+(6D tan-norm, heading-inv relative to the last-frame root), so the
+world-frame pelvis trajectory is reconstructed directly from those two —
+no velocity integration needed.  The last window frame is placed at a
+chosen anchor pose (default: the robot's default standing state) and the
+rest of the window is reconstructed relative to it.  EE positions come
+from the sampled ``ee_pos`` feature lifted into world via the per-frame
+pelvis pose.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +26,11 @@ from mjlab.viewer.viser.scene import MjlabViserScene
 
 from smp.pretrain.model import DiffusionDenoiser
 from smp.pretrain.scheduler import DDPMScheduler
-from smp.sampling.feature_to_state import window_to_pelvis_trajectory
+from smp.sampling.feature_to_state import (
+  NUM_EE,
+  window_to_ee_trajectories,
+  window_to_pelvis_trajectory,
+)
 from smp.utils import detect_device
 
 
@@ -70,7 +84,6 @@ def _build_model_and_scheduler(
     d_model=cfg.get("d_model", 256),
     nhead=cfg.get("nhead", 8),
     num_layers=cfg.get("num_layers", 2),
-    dim_feedforward=cfg.get("dim_feedforward", 1024),
     dropout=cfg.get("dropout", 0.0),
   ).to(device)
   state = ckpt.get("model_ema") or ckpt["model"]
@@ -162,7 +175,11 @@ def main(cfg: Cfg) -> None:
   robot: Entity = scene["robot"]
   mj_model = sim.mj_model
 
-  def run() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+  # Place the last window frame at the robot's default standing pose.
+  anchor_pelvis_pos = robot.data.default_root_state[0, 0:3].detach().cpu()
+  anchor_pelvis_quat = robot.data.default_root_state[0, 3:7].detach().cpu()
+
+  def run() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     pred_denorm = _run_generate(
       model,
       scheduler,
@@ -172,16 +189,33 @@ def main(cfg: Cfg) -> None:
       feature_dim,
       device,
     )
-    p0 = torch.zeros(3)
-    q0 = torch.tensor([1.0, 0.0, 0.0, 0.0])
-    p_pos, p_quat, p_joint = window_to_pelvis_trajectory(pred_denorm, p0, q0)
-    return p_pos.cpu().numpy(), p_quat.cpu().numpy(), p_joint.cpu().numpy()
+    p_pos, p_quat, p_joint = window_to_pelvis_trajectory(
+      pred_denorm,
+      anchor_pelvis_pos,
+      anchor_pelvis_quat,
+    )
+    ee_pos = window_to_ee_trajectories(pred_denorm, p_pos, p_quat)
+    return (
+      p_pos.cpu().numpy(),
+      p_quat.cpu().numpy(),
+      p_joint.cpu().numpy(),
+      ee_pos.cpu().numpy(),
+    )
 
   state: dict = {"pred": run()}
 
   server = viser.ViserServer()
   viser_scene = MjlabViserScene(server, mj_model, num_envs=1)
   viser_scene.debug_visualization_enabled = True
+
+  # /fixed_bodies parents under mjviser's camera-tracking scene offset, so
+  # the points stay aligned with the re-centered robot.
+  ee_points = server.scene.add_point_cloud(
+    name="/fixed_bodies/predicted_ee_positions",
+    points=np.zeros((NUM_EE, 3), dtype=np.float32),
+    colors=np.tile(np.array([255, 80, 0], dtype=np.uint8), (NUM_EE, 1)),
+    point_size=0.03,
+  )
 
   with server.gui.add_folder("Generate"):
     frame_slider = server.gui.add_slider(
@@ -201,7 +235,7 @@ def main(cfg: Cfg) -> None:
     state["pred"] = run()
 
   def render(frame: int) -> None:
-    p_pos, p_quat, p_joint = state["pred"]
+    p_pos, p_quat, p_joint, ee_pos = state["pred"]
     _write_pose_to_robot(robot, p_pos[frame], p_quat[frame], p_joint[frame], sim_device)
     sim.forward()
     wd = sim.wp_data
@@ -211,17 +245,18 @@ def main(cfg: Cfg) -> None:
       qpos=np.asarray(wd.qpos.numpy()),
       env_idx=0,
     )
+    ee_points.points = ee_pos[frame]
     viser_scene.refresh_visualization()
 
   print("Viser server running. Open the printed URL.")
-  dt = 1.0 / cfg.fps
+  dt_play = 1.0 / cfg.fps
   try:
     while True:
       render(int(frame_slider.value))
       if playing["v"]:
         nxt = (int(frame_slider.value) + 1) % window_size
         frame_slider.value = nxt
-      time.sleep(dt)
+      time.sleep(dt_play)
   except KeyboardInterrupt:
     print("Shutting down.")
 

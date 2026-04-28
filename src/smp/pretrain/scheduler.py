@@ -2,22 +2,31 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
 
-def _cosine_betas(num_timesteps: int, s: float = 0.008) -> torch.Tensor:
-  """Cosine ᾱ schedule from Nichol & Dhariwal 2021.
+def _cosine_betas(num_timesteps: int, max_beta: float = 0.999) -> torch.Tensor:
+  """Nichol & Dhariwal cosine β schedule with ``s = 0.008``.
 
-  ᾱ_t = cos²((t/T + s) / (1 + s) · π/2),  normalized so ᾱ_0 = 1.
+      ᾱ(t) = cos²((t + 0.008) / 1.008 · π/2),  t ∈ [0, 1]
+      β_i = min(1 − ᾱ((i+1)/T) / ᾱ(i/T), max_beta)
+
   Reaches ᾱ_T ≈ 0 even for small T (e.g. T=50), unlike the standard linear
-  schedule which only works at T≈1000. Returns the per-step β values.
+  schedule which only works at T≈1000.
   """
-  steps = num_timesteps + 1
-  x = torch.linspace(0, num_timesteps, steps, dtype=torch.float32)
-  alphas_cumprod = torch.cos(((x / num_timesteps) + s) / (1 + s) * torch.pi / 2) ** 2
-  betas = 1.0 - alphas_cumprod[1:] / alphas_cumprod[:-1]
-  return torch.clip(betas, 0.0, 0.999)
+
+  def alpha_bar(t: float) -> float:
+    return math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2
+
+  betas = []
+  for i in range(num_timesteps):
+    t1 = i / num_timesteps
+    t2 = (i + 1) / num_timesteps
+    betas.append(min(1.0 - alpha_bar(t2) / alpha_bar(t1), max_beta))
+  return torch.tensor(betas, dtype=torch.float32)
 
 
 class DDPMScheduler(nn.Module):
