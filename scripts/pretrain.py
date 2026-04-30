@@ -49,7 +49,7 @@ def _diffusion_loss(
   model: torch.nn.Module | DiffusionDenoiser,
   scheduler: DDPMScheduler,
   x_0: torch.Tensor,
-  num_noise_samples: int = 10,
+  num_noise_samples: int,
 ) -> torch.Tensor:
   """DDPM ε-prediction L1 loss with multiple noise samples per data point.
 
@@ -146,7 +146,7 @@ def pretrain(cfg: PretrainCfg) -> Path:
     print(f"EMA enabled (decay={cfg.ema_decay})")
 
   timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-  save_dir = Path(cfg.log_dir) / timestamp
+  save_dir = Path(cfg.log_dir) / cfg.name / timestamp
   save_dir.mkdir(parents=True, exist_ok=True)
 
   wandb_run = None
@@ -154,7 +154,7 @@ def pretrain(cfg: PretrainCfg) -> Path:
     import wandb
 
     wandb_run = wandb.init(
-      project=cfg.wandb_project, name=cfg.wandb_run_name, config=vars(cfg)
+      project=cfg.wandb_project, name=cfg.name, config=vars(cfg)
     )
 
   for epoch in range(cfg.num_epochs):
@@ -164,7 +164,7 @@ def pretrain(cfg: PretrainCfg) -> Path:
 
     for batch in train_loader:
       x_0 = batch.to(device, non_blocking=pin_memory)
-      loss = _diffusion_loss(model, scheduler, x_0)
+      loss = _diffusion_loss(model, scheduler, x_0, cfg.num_noise_samples)
 
       optimizer.zero_grad()
       loss.backward()
@@ -181,7 +181,9 @@ def pretrain(cfg: PretrainCfg) -> Path:
 
     if epoch % cfg.log_interval == 0:
       eval_model = ema.shadow if ema is not None else model
-      val_loss = _validate(eval_model, scheduler, val_loader, device, pin_memory)
+      val_loss = _validate(
+        eval_model, scheduler, val_loader, device, pin_memory, cfg.num_noise_samples
+      )
       print(f"Epoch {epoch:4d} | train={avg_loss:.6f} | val={val_loss:.6f}")
       if wandb_run is not None:
         wandb_run.log({"epoch": epoch, "train/loss": avg_loss, "val/loss": val_loss})
@@ -214,13 +216,14 @@ def _validate(
   val_loader: DataLoader[torch.Tensor],
   device: torch.device,
   pin_memory: bool,
+  num_noise_samples: int,
 ) -> float:
   model.eval()
   total = torch.zeros((), device=device)
   n = 0
   for batch in val_loader:
     x_0 = batch.to(device, non_blocking=pin_memory)
-    total += _diffusion_loss(model, scheduler, x_0)
+    total += _diffusion_loss(model, scheduler, x_0, num_noise_samples)
     n += 1
   return (total / max(n, 1)).item()
 

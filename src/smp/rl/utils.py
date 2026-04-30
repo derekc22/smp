@@ -69,7 +69,7 @@ class DiffNormalizer:
     num_timesteps: int,
     device: torch.device,
     min_value: float = 1e-4,
-    max_count: int = 100_000_000,
+    max_count: int = 50_000_000,
   ) -> None:
     self.min_value = min_value
     self.max_count = max_count

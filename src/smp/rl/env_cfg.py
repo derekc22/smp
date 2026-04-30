@@ -32,6 +32,7 @@ from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
 from smp.rl.events import (
+  gsi_refresh,
   gsi_reset,
   init_smp_state,
 )
@@ -111,9 +112,20 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     "init_smp_state": EventTermCfg(
       func=init_smp_state,
       mode="startup",
-      params={"ckpt_path": "logs/pretrain/pretrained.pt"},
+      params={
+        "ckpt_path": "logs/pretrain/pretrained.pt",
+        "gsi_buffer_size": 4096,
+        "gsi_batch_size": 1024,
+        "compile_model": True,
+        "compile_mode": "max-autotune",
+      },
     ),
     "gsi_reset": EventTermCfg(func=gsi_reset, mode="reset", params={}),
+    "gsi_refresh": EventTermCfg(
+      func=gsi_refresh,
+      mode="step",
+      params={"num_samples": 1024, "step_interval": 2400},
+    ),
     "push_robot": EventTermCfg(
       func=mdp.push_by_setting_velocity,
       mode="interval",
@@ -171,7 +183,7 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       weight=1.0,
       params={
         "fixed_timesteps": (8, 15, 22),
-        "ws": 2.0,
+        "ws": 4.0,
       },
     ),
   }
@@ -233,5 +245,8 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   if play:
     cfg.episode_length_s = int(1e9)
     cfg.events.pop("push_robot", None)
+    cfg.events.pop("gsi_refresh", None)
+    cfg.events["init_smp_state"].params["compile_model"] = False
+    cfg.events["init_smp_state"].params["gsi_buffer_size"] = 1024
 
   return cfg

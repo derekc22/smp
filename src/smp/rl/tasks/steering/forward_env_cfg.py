@@ -45,11 +45,6 @@ def g1_forward_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     weight=0.5,
     params={"command_name": "steering", "vel_err_scale": 0.5},
   )
-  cfg.rewards["steering_face_direction"] = RewardTermCfg(
-    func=mdp.steering_face_direction,
-    weight=0.1,
-    params={"command_name": "steering"},
-  )
 
   # --- Events --------------------------------------------------------------
   cfg.events["init_smp_state"].params["ckpt_path"] = (

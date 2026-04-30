@@ -33,11 +33,28 @@ def init_smp_state(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor | None = None,
   ckpt_path: str = "",
+  gsi_buffer_size: int = 4096,
+  gsi_batch_size: int = 256,
+  compile_model: bool = True,
+  compile_mode: str | None = None,
 ) -> None:
-  """Startup-mode event: load frozen denoiser, allocate buffer, prime buffer.
+  """Startup-mode event: load frozen denoiser, allocate buffer, prime GSI pool.
 
   Stashes the denoiser bundle, feature buffer, and ``DiffNormalizer`` on the
   env instance so the stock mjlab env class stays unsubclassed.
+
+  Pre-generates a pool of ``gsi_buffer_size`` denormalized windows by running
+  DDPM ancestral sampling in batches of ``gsi_batch_size``. ``gsi_reset``
+  then samples random windows from this pool instead of running DDPM per
+  reset, amortizing the diffusion cost across the whole training run
+  (mirrors MimicKit's SMP GSI buffer).
+
+  If ``compile_model`` is true, the denoiser is wrapped with
+  ``torch.compile`` (``fullgraph=True``) and pre-warmed at both the pool-gen
+  batch shape and the reward-path batch shape (``env.num_envs``) so all
+  Inductor compilation happens at startup, not on first sim step. Pass
+  ``compile_mode='reduce-overhead'`` (or ``'max-autotune'``) to opt into
+  more aggressive compile modes.
   """
   del env_ids
   if not ckpt_path:
@@ -47,8 +64,34 @@ def init_smp_state(
       "params={'ckpt_path': '/path/to/pretrained.pt'})."
     )
     raise RuntimeError(msg)
-  env._smp_bundle = load_denoiser(ckpt_path, env.device)  # type: ignore[attr-defined]
-  window_size = env._smp_bundle[5]  # type: ignore[attr-defined]
+  model, scheduler, q_low, q_high, feature_dim, window_size = load_denoiser(
+    ckpt_path, env.device
+  )
+  if compile_model:
+    # Inductor's pad_mm pass on recent torch reads the legacy
+    # ``torch.backends.cuda.matmul.allow_tf32`` getter, which raises if any
+    # other code (e.g. an upstream dep) has already set TF32 via the new
+    # ``torch.set_float32_matmul_precision`` API. Force a consistent state
+    # via the new API and disable shape padding to side-step the path.
+    torch.set_float32_matmul_precision("high")
+    try:
+      import torch._inductor.config as _ic
+
+      _ic.shape_padding = False
+    except ImportError:
+      pass
+    compile_kwargs: dict[str, object] = {"fullgraph": True}
+    if compile_mode is not None:
+      compile_kwargs["mode"] = compile_mode
+    model = torch.compile(model, **compile_kwargs)  # type: ignore[assignment]
+  env._smp_bundle = (  # type: ignore[attr-defined]
+    model,
+    scheduler,
+    q_low,
+    q_high,
+    feature_dim,
+    window_size,
+  )
   robot = env.scene["robot"]
   env._smp_ee_indexes = torch.tensor(  # type: ignore[attr-defined]
     robot.find_bodies(list(EE_BODY_NAMES), preserve_order=True)[0],
@@ -62,8 +105,23 @@ def init_smp_state(
     num_ee=NUM_EE,
     device=env.device,
   )
-  num_timesteps = env._smp_bundle[1].num_timesteps  # type: ignore[attr-defined]
-  env._smp_normalizer = DiffNormalizer(num_timesteps, env.device)  # type: ignore[attr-defined]
+  env._smp_normalizer = DiffNormalizer(scheduler.num_timesteps, env.device)  # type: ignore[attr-defined]
+
+  if gsi_buffer_size <= 0:
+    msg = f"gsi_buffer_size must be positive, got {gsi_buffer_size}."
+    raise ValueError(msg)
+  pool_chunks = []
+  for start in range(0, gsi_buffer_size, gsi_batch_size):
+    bsz = min(gsi_batch_size, gsi_buffer_size - start)
+    pool_chunks.append(_ddpm_sample(env, bsz))
+  env._smp_gsi_pool = torch.cat(pool_chunks, dim=0)  # type: ignore[attr-defined]
+
+  if compile_model and env.num_envs != gsi_batch_size:
+    # Warm the reward-path shape so its Inductor compile happens here.
+    with torch.no_grad():
+      dummy_x = torch.randn(env.num_envs, window_size, feature_dim, device=env.device)
+      dummy_t = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+      _ = model(dummy_x, dummy_t)
 
   gsi_reset(env)
 
@@ -149,13 +207,64 @@ def _prime_sim_and_buffer(
 
 
 @torch.no_grad()
+def _ddpm_sample(env: ManagerBasedRlEnv, n: int) -> torch.Tensor:
+  """Run DDPM ancestral sampling and return ``n`` denormalized windows."""
+  model, scheduler, q_low, q_high, feature_dim, window_size = env._smp_bundle  # type: ignore[attr-defined]
+  x_t = torch.randn(n, window_size, feature_dim, device=env.device)
+  for t_int in reversed(range(scheduler.num_timesteps)):
+    t = torch.full((n,), t_int, dtype=torch.long, device=env.device)
+    eps = model(x_t, t)
+    x_t = scheduler.step(eps, x_t, t_int)
+  return (x_t + 1.0) / 2.0 * (q_high - q_low) + q_low
+
+
+@torch.no_grad()
+def gsi_refresh(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | None = None,
+  num_samples: int = 1024,
+  step_interval: int = 2400,
+) -> None:
+  """Step-mode event: FIFO-replace ``num_samples`` windows in the GSI pool
+  every ``step_interval`` env steps with fresh DDPM samples.
+
+  Keeps the init-state distribution from staling. Mirrors MimicKit's
+  ``gsi_iters`` / ``gsi_regen_num_motions`` periodic refresh.
+
+  Wire as ``mode="step"`` so this fires once per env step; the modulo guard
+  short-circuits cheaply on non-trigger steps.
+  """
+  del env_ids
+  cur = int(env.common_step_counter)
+  if cur == 0 or (cur % step_interval) != 0:
+    return
+
+  pool: torch.Tensor = env._smp_gsi_pool  # type: ignore[attr-defined]
+  pool_size = pool.shape[0]
+  if num_samples > pool_size:
+    msg = f"num_samples ({num_samples}) cannot exceed pool size ({pool_size})"
+    raise ValueError(msg)
+
+  new_windows = _ddpm_sample(env, num_samples)
+  head = int(getattr(env, "_smp_gsi_head", 0))
+  end = head + num_samples
+  if end <= pool_size:
+    pool[head:end] = new_windows
+  else:
+    first = pool_size - head
+    pool[head:] = new_windows[:first]
+    pool[: end - pool_size] = new_windows[first:]
+  env._smp_gsi_head = end % pool_size  # type: ignore[attr-defined]
+
+
+@torch.no_grad()
 def gsi_reset(env: ManagerBasedRlEnv, env_ids: torch.Tensor | None = None) -> None:
   """Generative State Initialization.
 
-  Sample a full window from the SMP denoiser via DDPM ancestral sampling,
-  write the last frame's velocities and joint state to sim (with a default
-  root pose), and fill the feature buffer with the entire trajectory.
-  Must run AFTER mjlab's ``reset_base``.
+  Sample ``n`` random windows from the pre-generated GSI pool, write the
+  last frame's velocities and joint state to sim (with a default root pose),
+  and fill the feature buffer with the entire trajectory. Must run AFTER
+  mjlab's ``reset_base``.
   """
   if env_ids is None:
     env_ids = torch.arange(env.num_envs, device=env.device)
@@ -163,14 +272,7 @@ def gsi_reset(env: ManagerBasedRlEnv, env_ids: torch.Tensor | None = None) -> No
   if n == 0:
     return
 
-  model, scheduler, q_low, q_high, feature_dim, window_size = env._smp_bundle  # type: ignore[attr-defined]
-  W = window_size
-
-  x_t = torch.randn(n, W, feature_dim, device=env.device)
-  for t_int in reversed(range(scheduler.num_timesteps)):
-    t = torch.full((n,), t_int, dtype=torch.long, device=env.device)
-    eps = model(x_t, t)
-    x_t = scheduler.step(eps, x_t, t_int)
-
-  window = (x_t + 1.0) / 2.0 * (q_high - q_low) + q_low
+  pool: torch.Tensor = env._smp_gsi_pool  # type: ignore[attr-defined]
+  idx = torch.randint(0, pool.shape[0], (n,), device=env.device)
+  window = pool[idx]
   _prime_sim_and_buffer(env, env_ids, window)

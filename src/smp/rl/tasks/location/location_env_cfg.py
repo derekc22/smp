@@ -1,8 +1,10 @@
-"""G1 steering task with SMP guidance.
+"""G1 location task with SMP guidance.
 
-Each env gets a target xy direction + speed and a target facing direction,
-periodically resampled.  Reward = vel-track + face-align, on top of the SMP
-guidance reward inherited from ``g1_smp_env_cfg``.
+Each env gets a world-frame xy goal sampled at a random angle and distance
+from the character's current xy position, periodically resampled.
+Reward = position-tracking (always on) + optional velocity / face-direction
+shaping, on top of the SMP guidance reward inherited from
+``g1_smp_env_cfg``.
 """
 
 from __future__ import annotations
@@ -14,42 +16,35 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 
 from smp.rl.env_cfg import g1_smp_env_cfg
-from smp.rl.tasks.steering import mdp
+from smp.rl.tasks.location import mdp
 
 
-def g1_steering_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-  """Build the G1 steering env cfg with SMP guidance."""
+def g1_location_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Build the G1 location env cfg with SMP guidance."""
   cfg = g1_smp_env_cfg(play=play)
 
   # --- Commands ------------------------------------------------------------
-  cfg.commands["steering"] = mdp.SteeringCommandCfg(
+  cfg.commands["location"] = mdp.LocationCommandCfg(
     entity_name="robot",
-    resampling_time_range=(3.0, 8.0),
-    rand_tar_dir=True,
-    rand_face_dir=True,
-    tar_speed_min=0.5,
-    tar_speed_max=3.5,
+    resampling_time_range=(5.0, 10.0),
+    tar_dist_min=1.0,
+    tar_dist_max=10.0,
     debug_vis=True,
   )
 
   # --- Observations --------------------------------------------------------
   command_obs = ObservationTermCfg(
     func=mdp.generated_commands,
-    params={"command_name": "steering"},
+    params={"command_name": "location"},
   )
   cfg.observations["actor"].terms["command"] = command_obs
   cfg.observations["critic"].terms["command"] = command_obs
 
   # --- Rewards -------------------------------------------------------------
-  cfg.rewards["steering_target_velocity"] = RewardTermCfg(
-    func=mdp.steering_target_velocity,
-    weight=0.7,
-    params={"command_name": "steering", "vel_err_scale": 1.0},
-  )
-  cfg.rewards["steering_face_direction"] = RewardTermCfg(
-    func=mdp.steering_face_direction,
-    weight=0.3,
-    params={"command_name": "steering"},
+  cfg.rewards["location_position"] = RewardTermCfg(
+    func=mdp.location_position,
+    weight=1.0,
+    params={"command_name": "location", "pos_err_scale": 0.5},
   )
   cfg.rewards["smp_guidance"].params["ws"] = 6.0
 

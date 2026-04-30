@@ -26,6 +26,8 @@ class PretrainCfg:
 
   # Diffusion
   num_timesteps: int = 50
+  num_noise_samples: int = 10
+  """Random (t, ε) draws per data point in the diffusion loss."""
 
   # EMA
   use_ema: bool = False
@@ -39,11 +41,12 @@ class PretrainCfg:
   max_grad_norm: float = 1.0
 
   # Logging
+  name: str = "pretrain"
+  """Run identifier; used as the wandb run name and the save subfolder."""
   log_interval: int = 10
   save_interval: int = 100
   log_dir: str = "logs/pretrain"
   wandb_project: str = "smp"
-  wandb_run_name: str = "pretrain"
   use_wandb: bool = True
 
   # Device
