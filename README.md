@@ -56,12 +56,12 @@ uv sync
 Four downstream tasks are registered with `mjlab.tasks.registry` (importing
 `smp.rl.tasks` self-registers them):
 
-| Task              | Env config                                      | Prior                      | Task objective                          | Demo |
-| ----------------- | ----------------------------------------------- | -------------------------- | --------------------------------------- | :--: |
-| `Smp-Forward-G1`  | `src/smp/rl/tasks/steering/forward_env_cfg.py`  | `pretrained_loco.pt`       | walk/jog/run at a commanded `+x` speed  | <img src="https://raw.githubusercontent.com/SUZ-tsinghua/smp/assets/forward.gif" width="200"/> |
-| `Smp-Steering-G1` | `src/smp/rl/tasks/steering/steering_env_cfg.py` | `pretrained_lafan_run.pt`  | track a commanded velocity + facing dir |  |
-| `Smp-Location-G1` | `src/smp/rl/tasks/location/location_env_cfg.py` | `pretrained_lafan_run.pt`  | walk to a world-frame xy goal           | <img src="https://raw.githubusercontent.com/SUZ-tsinghua/smp/assets/location.gif" width="200"/> |
-| `Smp-Getup-G1`    | `src/smp/rl/tasks/getup/getup_env_cfg.py`       | `pretrained_getup_f2s2.pt` | stand up from a fallen pose             | <img src="https://raw.githubusercontent.com/SUZ-tsinghua/smp/assets/getup.gif" width="200"/> |
+| Task              | Demo | Description                              |
+| ----------------- | :--: | ---------------------------------------- |
+| `Smp-Forward-G1`  | <img src="https://raw.githubusercontent.com/SUZ-tsinghua/smp/assets/forward.gif" width="200"/> | walk / jog / run at a commanded `+x` speed |
+| `Smp-Steering-G1` | <img src="https://raw.githubusercontent.com/SUZ-tsinghua/smp/assets/steering.gif" width="200"/> | track a commanded velocity + facing direction |
+| `Smp-Location-G1` | <img src="https://raw.githubusercontent.com/SUZ-tsinghua/smp/assets/location.gif" width="200"/> | walk to a world-frame xy goal |
+| `Smp-Getup-G1`    | <img src="https://raw.githubusercontent.com/SUZ-tsinghua/smp/assets/getup.gif" width="200"/> | stand up from a fallen pose |
 
 ### Train / play
 
@@ -111,14 +111,17 @@ are large, and collapses toward 0 if *either* drops. This makes reward tuning
   product both failure modes score ≈ 0, so the only way to earn reward is to do
   the task *and* stay on the motion manifold.
 
-Per-task `taskᵢ` components (combined, then gated by `r_smp`):
+Per-task `taskᵢ` components (each weighted, summed, then gated by `r_smp`):
 
-- **Forward / Steering** — velocity tracking `exp(−·‖v_cmd − v_xy‖²)` (zeroed when
-  velocity projects backwards); Steering adds a facing-direction term
-  (`0.7·vel + 0.3·face`).
-- **Location** — position tracking `exp(−·‖xy_goal − xy_robot‖²)` toward a
-  periodically resampled world-frame goal.
-- **Get-up** — `0.7·` upward head velocity `+ 0.3·` head-height tracking.
+- **Forward** — velocity tracking only: `exp(−s·‖v_cmd − v_xy‖²)`, zeroed when the
+  velocity projects backwards onto the target direction. Fixed `+x` heading,
+  commanded speed 0.5–5 m/s.
+- **Steering** — `0.5·` velocity tracking `+ 0.5·` facing alignment
+  `max(face_dir · heading, 0)`; randomized target direction + facing, speed 0.5–2 m/s.
+- **Location** — position tracking only: `exp(−s·‖xy_goal − xy_robot‖)` toward a
+  periodically resampled world-frame goal (uses `ws=4`).
+- **Get-up** — `0.7·` upward head velocity `+ 0.3·` head-height tracking, each
+  `exp(−s·max(target − ·, 0)²)`, from a fallen GSI start.
 
 ### Generative State Initialization (GSI)
 
