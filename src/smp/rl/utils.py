@@ -59,9 +59,8 @@ def load_denoiser(
 class DiffNormalizer:
   """Count-based running mean, one scalar per diffusion timestep.
 
-  Equal weighting across all observed samples — the normalizer naturally
-  freezes as the sample count grows, giving a stable reference scale for
-  SDS MSE values instead of a moving EMA target that drifts with the policy.
+  Equal-weighted over all samples, so it freezes as the count grows — a stable
+  reference scale for SDS MSE values, unlike an EMA that drifts with the policy.
   """
 
   def __init__(
@@ -77,11 +76,9 @@ class DiffNormalizer:
     self.count = torch.zeros(num_timesteps, device=device, dtype=torch.long)
 
   def update_and_normalize(self, t: int, mse_per_env: torch.Tensor) -> torch.Tensor:
-    """Record a per-env batch of MSE values for timestep ``t`` and return
-    ``mse_per_env`` divided by the running mean at ``t``."""
+    """Record MSE values for timestep ``t``; return them divided by the mean."""
     if self.count[t] > self.max_count:
-      # Freeze once enough samples have been seen — the mean is stable and
-      # further updates would barely move it (and risk count overflow).
+      # Freeze once stable (and avoid count overflow).
       return mse_per_env / self.mean[t].clamp(min=self.min_value)
     n = mse_per_env.numel()
     batch_mean = mse_per_env.mean()
@@ -98,18 +95,17 @@ class DiffNormalizer:
 
 
 class MotionFeatureBuffer:
-  """Rolling per-env buffer producing AMP-aligned motion features.
-
-  Stores the last ``window_size`` raw world-frame kinematic samples per env
-  and, on ``compute_features()``, returns a window anchored at the LAST frame's
-  yaw-only local frame with the per-frame layout:
+  """Rolling per-env buffer of the last ``window_size`` world-frame kinematic
+  samples.  ``compute_features()`` returns a window anchored at the LAST frame's
+  yaw-only local frame, layout (matching ``scripts/csv_to_npz.py``):
 
       ``[root_pos(3), root_rot(6), joint_pos(J), ee_pos(E*3),
          root_lin_vel(3), root_ang_vel(3)]``
 
-  Matches ``scripts/csv_to_npz.py``.  ``joint_vel`` is stored internally so
-  the API stays symmetric with sim observations, but is NOT part of the
-  feature output.
+  ``joint_vel`` is stored for API symmetry but is NOT part of the output.
+
+  Positions are stored in whatever frame the caller supplies; SMP RL feeds
+  env-origin-relative positions so features are invariant to env placement.
   """
 
   def __init__(

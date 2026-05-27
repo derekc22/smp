@@ -1,9 +1,8 @@
 """Steering command — target xy direction + speed + face direction.
 
-Each env carries a world-frame target velocity direction, target speed, and
-face direction.  Resampled on a fixed time interval.  The exposed
-``command`` is in the robot's local heading frame so the policy observation
-is yaw-invariant.
+Each env carries a periodically-resampled world-frame target dir, speed, and
+face dir; the exposed command is in the robot's local heading frame, so the
+observation is yaw-invariant.
 """
 
 from __future__ import annotations

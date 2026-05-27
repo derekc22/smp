@@ -1,4 +1,7 @@
-"""Steering rewards: linear-velocity tracking + face-direction alignment."""
+"""Steering reward components: linear-velocity tracking + face alignment.
+
+SMP-gated via the generic ``smp.rl.rewards.smp_product``.
+"""
 
 from __future__ import annotations
 
@@ -22,11 +25,9 @@ def steering_target_velocity(
   vel_err_scale: float = 0.5,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-  """``exp(-vel_err_scale * ‖tar_speed·tar_dir - root_vel_xy‖²)``.
-
-  Zeroed out for envs whose root velocity projects negatively onto the target
-  direction (so the reward cannot be farmed by walking the wrong way).
-  """
+  """``exp(-vel_err_scale * ‖tar_speed·tar_dir - root_vel_xy‖²)``, zeroed when
+  root velocity projects negatively onto the target dir (no reward for walking
+  the wrong way)."""
   asset = env.scene[asset_cfg.name]
   cmd: "SteeringCommand" = env.command_manager.get_term(command_name)  # type: ignore[assignment]
 

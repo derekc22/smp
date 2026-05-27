@@ -1,15 +1,9 @@
 """Startup + reset events for SMP RL.
 
-These run from mjlab's event manager so the task can be a plain
-``ManagerBasedRlEnv`` and we can use mjlab's built-in train/play scripts.
-
-Per-frame motion features encode velocities + joint angles + EE positions
-(see ``scripts/csv_to_npz.py``), so they do NOT directly carry an absolute
-root pose.  On GSI we therefore write a DEFAULT root pose (origin xy,
-default standing height, identity yaw) to sim and prime the feature buffer
-with kinematics consistent with that pose.  This gives the policy a varied
-joint / velocity distribution at reset time even though the root frame
-itself is always the same.
+Run from mjlab's event manager so the task stays a plain ``ManagerBasedRlEnv``.
+Motion features carry no absolute root pose, so GSI writes a default root frame
+(each env's origin, identity yaw) to sim and primes the feature buffer in an
+env-origin-relative frame, so the SMP reward is invariant to env placement.
 """
 
 from __future__ import annotations
@@ -29,6 +23,25 @@ from smp.sampling.feature_to_state import (
 NUM_JOINTS = 29
 
 
+def _maybe_compile(model, compile_model: bool, compile_mode: str | None):
+  """``torch.compile`` ``model``, working around the Inductor ``pad_mm`` pass
+  that crashes when TF32 was set via ``set_float32_matmul_precision``: force a
+  consistent state and disable shape padding.  No-op if ``compile_model`` false.
+  """
+  if not compile_model:
+    return model
+  torch.set_float32_matmul_precision("high")
+  try:
+    import torch._inductor.config as _ic
+
+    _ic.shape_padding = False
+  except ImportError:
+    pass
+  if compile_mode is not None:
+    return torch.compile(model, fullgraph=True, mode=compile_mode)
+  return torch.compile(model, fullgraph=True)
+
+
 def init_smp_state(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor | None = None,
@@ -40,21 +53,13 @@ def init_smp_state(
 ) -> None:
   """Startup-mode event: load frozen denoiser, allocate buffer, prime GSI pool.
 
-  Stashes the denoiser bundle, feature buffer, and ``DiffNormalizer`` on the
-  env instance so the stock mjlab env class stays unsubclassed.
-
-  Pre-generates a pool of ``gsi_buffer_size`` denormalized windows by running
-  DDPM ancestral sampling in batches of ``gsi_batch_size``. ``gsi_reset``
-  then samples random windows from this pool instead of running DDPM per
-  reset, amortizing the diffusion cost across the whole training run
-  (mirrors MimicKit's SMP GSI buffer).
-
-  If ``compile_model`` is true, the denoiser is wrapped with
-  ``torch.compile`` (``fullgraph=True``) and pre-warmed at both the pool-gen
-  batch shape and the reward-path batch shape (``env.num_envs``) so all
-  Inductor compilation happens at startup, not on first sim step. Pass
-  ``compile_mode='reduce-overhead'`` (or ``'max-autotune'``) to opt into
-  more aggressive compile modes.
+  Stashes the denoiser bundle, feature buffer, and ``DiffNormalizer`` on the env
+  so the stock mjlab env class stays unsubclassed.  Pre-generates a pool of
+  ``gsi_buffer_size`` denormalized windows (DDPM sampling in ``gsi_batch_size``
+  batches) that ``gsi_reset`` samples from, amortizing the diffusion cost.  When
+  ``compile_model``, the denoiser is ``torch.compile``-d and pre-warmed at both
+  the pool-gen and reward-path (``env.num_envs``) shapes so all Inductor compile
+  happens here, not on the first sim step.
   """
   del env_ids
   if not ckpt_path:
@@ -67,23 +72,7 @@ def init_smp_state(
   model, scheduler, q_low, q_high, feature_dim, window_size = load_denoiser(
     ckpt_path, env.device
   )
-  if compile_model:
-    # Inductor's pad_mm pass on recent torch reads the legacy
-    # ``torch.backends.cuda.matmul.allow_tf32`` getter, which raises if any
-    # other code (e.g. an upstream dep) has already set TF32 via the new
-    # ``torch.set_float32_matmul_precision`` API. Force a consistent state
-    # via the new API and disable shape padding to side-step the path.
-    torch.set_float32_matmul_precision("high")
-    try:
-      import torch._inductor.config as _ic
-
-      _ic.shape_padding = False
-    except ImportError:
-      pass
-    compile_kwargs: dict[str, object] = {"fullgraph": True}
-    if compile_mode is not None:
-      compile_kwargs["mode"] = compile_mode
-    model = torch.compile(model, **compile_kwargs)  # type: ignore[assignment]
+  model = _maybe_compile(model, compile_model, compile_mode)
   env._smp_bundle = (  # type: ignore[attr-defined]
     model,
     scheduler,
@@ -110,7 +99,7 @@ def init_smp_state(
   if gsi_buffer_size <= 0:
     msg = f"gsi_buffer_size must be positive, got {gsi_buffer_size}."
     raise ValueError(msg)
-  pool_chunks = []
+  pool_chunks: list[torch.Tensor] = []
   for start in range(0, gsi_buffer_size, gsi_batch_size):
     bsz = min(gsi_batch_size, gsi_buffer_size - start)
     pool_chunks.append(_ddpm_sample(env, bsz))
@@ -131,17 +120,13 @@ def _prime_sim_and_buffer(
   env_ids: torch.Tensor,
   window: torch.Tensor,
 ) -> None:
-  """Common GSI tail: write last frame to sim, fill the feature buffer.
+  """Common GSI tail: write the last frame to sim, fill the feature buffer.
 
-  Features carry root_pos (xy heading-inv + world z) and root_rot
-  (heading-inv relative quat), so per-frame world pose is reconstructable
-  directly.  The sim write anchors xy/yaw at the default root_pos / yaw
-  (origin + identity yaw); per-frame heights and pitch/roll come from the
-  features so the buffer's compute_features round-trip reproduces the
-  stored window.
-
-  Joint velocities are reconstructed from the joint-angle trajectory via
-  finite differences, since joint_vel is not part of the feature window.
+  The buffer is filled in an env-origin-RELATIVE frame (anchored at the default
+  root xy/yaw); the sim write adds each env's origin so robots spread across the
+  grid.  Keeping the buffer env-relative makes ``compute_features`` (and the SMP
+  reward) invariant to env placement.  Joint velocities are finite-differenced
+  from the joint-angle trajectory (joint_vel is not in the feature window).
   """
   n, W, _ = window.shape
   E = NUM_EE
@@ -186,8 +171,15 @@ def _prime_sim_and_buffer(
   ee_offset_w = quat_apply(yaw_T_E, ee_pos_local.reshape(-1, 3)).reshape(n, W, E, 3)
   ee_pos_w = ee_offset_w + pelvis_pos_w[:, :, None, :]
 
+  # Buffer stays env-relative; the sim write is offset to each env's origin.
+  origins = env.scene.env_origins[env_ids]
   last_root_state = torch.cat(
-    [pelvis_pos_w[:, -1], pelvis_quat_w[:, -1], lin_vel_w[:, -1], ang_vel_w[:, -1]],
+    [
+      pelvis_pos_w[:, -1] + origins,
+      pelvis_quat_w[:, -1],
+      lin_vel_w[:, -1],
+      ang_vel_w[:, -1],
+    ],
     dim=-1,
   )
   robot.write_root_state_to_sim(last_root_state, env_ids=env_ids)
@@ -225,14 +217,10 @@ def gsi_refresh(
   num_samples: int = 1024,
   step_interval: int = 2400,
 ) -> None:
-  """Step-mode event: FIFO-replace ``num_samples`` windows in the GSI pool
-  every ``step_interval`` env steps with fresh DDPM samples.
-
-  Keeps the init-state distribution from staling. Mirrors MimicKit's
-  ``gsi_iters`` / ``gsi_regen_num_motions`` periodic refresh.
-
-  Wire as ``mode="step"`` so this fires once per env step; the modulo guard
-  short-circuits cheaply on non-trigger steps.
+  """Step-mode event: every ``step_interval`` env steps, FIFO-replace
+  ``num_samples`` windows in the GSI pool with fresh DDPM samples so the
+  init-state distribution doesn't stale.  Fires per step; the modulo guard
+  short-circuits on non-trigger steps.
   """
   del env_ids
   cur = int(env.common_step_counter)
@@ -259,12 +247,8 @@ def gsi_refresh(
 
 @torch.no_grad()
 def gsi_reset(env: ManagerBasedRlEnv, env_ids: torch.Tensor | None = None) -> None:
-  """Generative State Initialization.
-
-  Sample ``n`` random windows from the pre-generated GSI pool, write the
-  last frame's velocities and joint state to sim (with a default root pose),
-  and fill the feature buffer with the entire trajectory. Must run AFTER
-  mjlab's ``reset_base``.
+  """Generative State Initialization: sample ``n`` windows from the GSI pool and
+  prime sim + feature buffer from them.  Must run AFTER mjlab's ``reset_base``.
   """
   if env_ids is None:
     env_ids = torch.arange(env.num_envs, device=env.device)

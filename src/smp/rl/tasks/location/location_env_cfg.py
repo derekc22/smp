@@ -1,10 +1,7 @@
 """G1 location task with SMP guidance.
 
-Each env gets a world-frame xy goal sampled at a random angle and distance
-from the character's current xy position, periodically resampled.
-Reward = position-tracking (always on) + optional velocity / face-direction
-shaping, on top of the SMP guidance reward inherited from
-``g1_smp_env_cfg``.
+Each env gets a periodically-resampled world-frame xy goal; reward is
+position-tracking gated by the SMP guidance reward.
 """
 
 from __future__ import annotations
@@ -16,6 +13,7 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 
 from smp.rl.env_cfg import g1_smp_env_cfg
+from smp.rl.rewards import task_smp_product
 from smp.rl.tasks.location import mdp
 
 
@@ -41,12 +39,20 @@ def g1_location_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.observations["critic"].terms["command"] = command_obs
 
   # --- Rewards -------------------------------------------------------------
-  cfg.rewards["location_position"] = RewardTermCfg(
-    func=mdp.location_position,
+  # task = position tracking, gated by SMP.
+  cfg.rewards["task_smp_product"] = RewardTermCfg(
+    func=task_smp_product,
     weight=1.0,
-    params={"command_name": "location", "pos_err_scale": 0.5},
+    params={
+      "task_terms": (
+        (
+          mdp.location_position,
+          1.0,
+          {"command_name": "location", "pos_err_scale": 0.1},
+        ),
+      ),
+    },
   )
-  cfg.rewards["smp_guidance"].params["ws"] = 6.0
 
   # --- Events --------------------------------------------------------------
   cfg.events["init_smp_state"].params["ckpt_path"] = (

@@ -13,6 +13,7 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 
 from smp.rl.env_cfg import g1_smp_env_cfg
+from smp.rl.rewards import task_smp_product
 from smp.rl.tasks.steering import mdp
 
 
@@ -27,7 +28,7 @@ def g1_forward_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     rand_tar_dir=False,
     rand_face_dir=False,
     tar_speed_min=0.5,
-    tar_speed_max=3.5,
+    tar_speed_max=5.0,
     debug_vis=True,
   )
 
@@ -40,10 +41,19 @@ def g1_forward_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.observations["critic"].terms["command"] = command_obs
 
   # --- Rewards -------------------------------------------------------------
-  cfg.rewards["steering_target_velocity"] = RewardTermCfg(
-    func=mdp.steering_target_velocity,
-    weight=0.5,
-    params={"command_name": "steering", "vel_err_scale": 0.5},
+  # task = velocity tracking, gated by SMP.
+  cfg.rewards["task_smp_product"] = RewardTermCfg(
+    func=task_smp_product,
+    weight=1.0,
+    params={
+      "task_terms": (
+        (
+          mdp.steering_target_velocity,
+          1.0,
+          {"command_name": "steering", "vel_err_scale": 0.5},
+        ),
+      ),
+    },
   )
 
   # --- Events --------------------------------------------------------------

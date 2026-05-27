@@ -1,10 +1,8 @@
 """Shared G1 + SMP guidance env config.
 
-Uses the stock ``ManagerBasedRlEnv`` — the SMP feature buffer and frozen
-denoiser are attached via startup/reset events in ``smp.rl.events`` so this
-task can be registered with ``mjlab.tasks.registry`` and run through
-``mjlab-train`` / ``mjlab-play``.  Per-task configs (e.g. steering) extend
-this with task-specific commands, observations, and rewards.
+The SMP feature buffer and frozen denoiser are attached to the stock
+``ManagerBasedRlEnv`` via the startup/reset events in ``smp.rl.events``.
+Per-task configs extend this with task-specific commands/observations/rewards.
 """
 
 from __future__ import annotations
@@ -36,17 +34,13 @@ from smp.rl.events import (
   gsi_reset,
   init_smp_state,
 )
-from smp.rl.rewards import (
-  smp_guidance_reward,
-)
 
 
 def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   """Build the shared G1 + SMP env cfg.
 
-  The pretrained SMP denoiser checkpoint path is hardcoded on the
-  ``init_smp_state`` event below — override it from the task config if you
-  want a different checkpoint.
+  The denoiser checkpoint path is set on the ``init_smp_state`` event below;
+  override it from the task config.
   """
 
   # --- Observations --------------------------------------------------------
@@ -177,16 +171,9 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   }
 
   # --- Rewards -------------------------------------------------------------
-  rewards: dict[str, RewardTermCfg] = {
-    "smp_guidance": RewardTermCfg(
-      func=smp_guidance_reward,
-      weight=1.0,
-      params={
-        "fixed_timesteps": (8, 15, 22),
-        "ws": 4.0,
-      },
-    ),
-  }
+  # Empty by design: each task adds its own ``task_smp_product`` term
+  # (task reward × SMP guidance).
+  rewards: dict[str, RewardTermCfg] = {}
 
   # --- Sensors -------------------------------------------------------------
   self_collision_cfg = ContactSensorCfg(

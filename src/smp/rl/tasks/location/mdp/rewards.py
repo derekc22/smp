@@ -1,4 +1,6 @@
-"""Location rewards: position tracking.
+"""Location reward component: position tracking.
+
+SMP-gated via the generic ``smp.rl.rewards.smp_product``.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ if TYPE_CHECKING:
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
+
 def location_position(
   env: "ManagerBasedRlEnv",
   command_name: str,
@@ -26,5 +29,5 @@ def location_position(
   asset = env.scene[asset_cfg.name]
   cmd: "LocationCommand" = env.command_manager.get_term(command_name)  # type: ignore[assignment]
   pos_diff = cmd.tar_pos_w - asset.data.root_link_pos_w[:, :2]
-  pos_err = (pos_diff * pos_diff).sum(dim=-1)
+  pos_err = (pos_diff * pos_diff).sum(dim=-1).sqrt()
   return torch.exp(-pos_err_scale * pos_err)

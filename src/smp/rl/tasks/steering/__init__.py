@@ -2,22 +2,14 @@
 on import."""
 
 from mjlab.tasks.registry import register_mjlab_task
-from mjlab.tasks.tracking.config.g1.rl_cfg import unitree_g1_tracking_ppo_runner_cfg
 
+from smp.rl.rl_cfg import unitree_g1_smp_ppo_runner_cfg
 from smp.rl.tasks.steering.forward_env_cfg import g1_forward_smp_env_cfg
 from smp.rl.tasks.steering.steering_env_cfg import g1_steering_smp_env_cfg
 
-_steering_rl = unitree_g1_tracking_ppo_runner_cfg()
+_steering_rl = unitree_g1_smp_ppo_runner_cfg()
 _steering_rl.experiment_name = "smp_steering_g1"
 _steering_rl.run_name = "smp_steering_g1"
-_steering_rl.wandb_project = "smp"
-_steering_rl.actor.distribution_cfg = {
-  "class_name": "GaussianDistribution",
-  "init_std": 0.30,
-  "std_type": "scalar",
-  "learn_std": False,
-}
-_steering_rl.algorithm.entropy_coef = 0.0
 
 register_mjlab_task(
   task_id="Smp-Steering-G1",
@@ -26,17 +18,9 @@ register_mjlab_task(
   rl_cfg=_steering_rl,
 )
 
-_forward_rl = unitree_g1_tracking_ppo_runner_cfg()
+_forward_rl = unitree_g1_smp_ppo_runner_cfg()
 _forward_rl.experiment_name = "smp_forward_g1"
 _forward_rl.run_name = "smp_forward_g1"
-_forward_rl.wandb_project = "smp"
-_forward_rl.actor.distribution_cfg = {
-  "class_name": "GaussianDistribution",
-  "init_std": 0.30,
-  "std_type": "scalar",
-  "learn_std": False,
-}
-_forward_rl.algorithm.entropy_coef = 0.0
 
 register_mjlab_task(
   task_id="Smp-Forward-G1",

@@ -1,9 +1,8 @@
-"""Location command — periodic xy goal positions in the world frame.
+"""Location command — periodic world-frame xy goal.
 
-Each env carries a world-frame xy target sampled at a random angle and
-distance from the character's current xy position.  The command exposed to
-the policy is the local-frame xy offset to the goal so the observation is
-yaw-invariant.
+Each env carries a world-frame xy target (random angle + distance from the
+current position); the command exposed to the policy is the local-frame offset
+to the goal, so the observation is yaw-invariant.
 """
 
 from __future__ import annotations

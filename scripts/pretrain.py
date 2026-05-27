@@ -153,9 +153,7 @@ def pretrain(cfg: PretrainCfg) -> Path:
   if cfg.use_wandb:
     import wandb
 
-    wandb_run = wandb.init(
-      project=cfg.wandb_project, name=cfg.name, config=vars(cfg)
-    )
+    wandb_run = wandb.init(project=cfg.wandb_project, name=cfg.name, config=vars(cfg))
 
   for epoch in range(cfg.num_epochs):
     model.train()
