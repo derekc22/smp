@@ -44,10 +44,94 @@ uv sync
 
 ## Pipeline
 
-1. **Data processing** (CSV → windowed NPZ → normalization stats) — _TODO (docs pending)._
+1. **Data processing** (CSV → windowed NPZ → normalization stats) — documented below.
 2. **Diffusion pretraining** (DDPM ε-predictor on motion windows) — _TODO (docs pending)._
    You can skip this entirely using the [shipped checkpoints](#provided-pretrained-priors).
 3. **RL** (PPO with the frozen prior as a guidance reward) — documented below.
+
+---
+
+## Data processing
+
+Stage 1 turns raw motion CSVs into the windowed feature tensors the diffusion
+prior trains on, plus the normalization stats shared by pretraining and RL. Both
+scripts are `tyro`-driven — run them under `uv` from the project root.
+
+### Input CSVs (LAFAN1 retargeting format)
+
+Inputs must follow the same per-frame CSV layout as the
+**[LAFAN1 Retargeting Dataset](https://huggingface.co/datasets/lvhaidong/LAFAN1_Retargeting_Dataset)**
+(`g1` split) — this is the format `mjlab`'s `MotionLoader` reads. Each file is
+header-less, comma-separated, one row per frame at **30 fps**, with **36 columns**:
+
+| Columns | Field                       | Notes                                                              |
+| ------- | --------------------------- | ------------------------------------------------------------------ |
+| 0–2     | root position `x y z`       | world frame, metres                                                |
+| 3–6     | root orientation quaternion | **`x y z w`** order                                                |
+| 7–35    | 29 G1 joint angles          | radians; joint order = `JOINT_NAMES` in `scripts/csv_to_npz.py`    |
+
+The CSVs are **not** shipped with this repo — download them yourself. To get the
+full G1 set, grab the dataset's
+[`g1/`](https://huggingface.co/datasets/lvhaidong/LAFAN1_Retargeting_Dataset/tree/main/g1)
+folder into `datasets/csv/lafan/`:
+
+```bash
+# e.g. with the Hugging Face CLI:  pip install -U huggingface_hub
+hf download lvhaidong/LAFAN1_Retargeting_Dataset --repo-type dataset \
+  --include "g1/*.csv" --local-dir datasets/csv/_lafan_dl
+mv datasets/csv/_lafan_dl/g1/*.csv datasets/csv/lafan/
+```
+
+> `csv_to_npz.py` globs `*.csv` **non-recursively**, so the CSV files must sit
+> directly under `--input-dir` (not in a nested `g1/`).
+
+### CSV → windowed NPZ
+
+```bash
+uv run scripts/csv_to_npz.py \
+  --input-dir datasets/csv/lafan \
+  --output-dir datasets/npz/lafan
+```
+
+For each CSV this replays the motion through the G1 sim, forward-kinematics the
+tracked end-effectors, interpolates 30 → 50 fps, and slices the result into
+**pelvis-anchored, yaw-only** windows of shape `(N, window_size, 59)` — one `.npz`
+per clip. The 59-dim per-frame feature layout (reproduced online by the RL feature
+buffer) is `[root_pos(3), root_rot(6), joint_pos(29), ee_pos(15), root_lin_vel(3),
+root_ang_vel(3)]`.
+
+Useful flags: `--window-size` (default `10`), `--stride` (`1`), `--input-fps`
+(`30`), `--output-fps` (`50`), and `--shard-index / --num-shards` to split a large
+corpus across parallel runs.
+
+### Normalization stats
+
+```bash
+uv run scripts/compute_norm_stats.py \
+  --input-dir datasets/npz/lafan \
+  --output datasets/norm_stats.npz
+```
+
+This concatenates every window under `--input-dir` and writes per-feature
+**q01/q99 quantiles** (`q_low` / `q_high`; tunable via `--q-low / --q-high`) used
+to map features to `[-1, 1]`.
+
+**A `datasets/norm_stats.npz` computed over the full LAFAN G1 set is checked into
+the repo**, and pretraining defaults to it (`--norm-stats-file
+datasets/norm_stats.npz`). When (re)training a prior, **prefer reusing this
+LAFAN-computed file** rather than recomputing stats on your own (often narrow)
+clips — recompute only if you change the feature layout. The note below explains
+why a wide normalizer matters.
+
+> **Compute these on a diverse dataset (all of LAFAN), not a narrow one.** The
+> q01/q99 range defines the feature normalization and is **baked into the
+> pretrained checkpoint** — the exact mapping the frozen denoiser sees at RL time.
+> A PPO policy routinely wanders outside the pretraining motion distribution; if the
+> normalizer was fit to a small set (e.g. just the walk/jog/run clips), those
+> out-of-range features saturate toward ±1, the denoiser receives
+> **out-of-distribution** inputs, and its score estimate — hence the SMP guidance
+> reward — degrades exactly where the policy needs it. A wide normalizer keeps the
+> score reliable across the states RL actually visits.
 
 ---
 
