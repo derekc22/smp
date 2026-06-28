@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pickle
 import sys
 import types
 from pathlib import Path
@@ -11,7 +10,18 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from smp.rl.object_goal_features import DEFAULT_WINDOW_SIZE, ObjectGoalFeatureBuilder
+from smp.rl.object_goal_assets import (
+  ObjectGoalRuntimeContextBuilder,
+  hf_sample_window_tensors,
+  load_hf_bps_pickle,
+  load_hf_object_asset_metadata,
+  mesh_centroid_to_body_pos,
+)
+from smp.rl.object_goal_features import (
+  DEFAULT_WINDOW_SIZE,
+  ObjectGoalFeatureBuilder,
+  ObjectGoalMotionBuffer,
+)
 from smp.rl.object_goal_prior import DEFAULT_SDS_TIMESTEPS, ObjectGoalTwoStagePrior
 
 if TYPE_CHECKING:
@@ -76,11 +86,19 @@ def load_object_goal_hf_bps_context(
   if not input_path.exists():
     raise FileNotFoundError(f"HF-BPS context PKL not found: {input_path}")
 
-  _install_numpy_pickle_aliases()
-  with open(input_path, "rb") as f:
-    data = pickle.load(f)
+  data = load_hf_bps_pickle(input_path)
   builder = ObjectGoalFeatureBuilder(g1_root, device=env.device)
   sample = builder.hf_bps_window_to_tensors(data, start=start, window_size=window_size)
+  metadata = load_hf_object_asset_metadata(
+    input_pkl=input_path,
+    g1_diffusion_root=g1_root,
+  )
+  sample_window = hf_sample_window_tensors(
+    metadata,
+    start=start,
+    window_size=window_size,
+    device=env.device,
+  )
 
   _set_context_tensor(env, "_object_goal_bps_encoding", sample["bps"])
   _set_context_tensor(env, "_object_goal_static_bps_context", sample["static_bps_context"])
@@ -100,12 +118,128 @@ def load_object_goal_hf_bps_context(
   if data.get("object_name") is not None:
     env._object_goal_object_name = str(data["object_name"])  # type: ignore[attr-defined]
 
-  # These are useful for diagnostic envs that do not yet instantiate a real
-  # object entity. The reward still fails without explicit object pose or a real
-  # object body, preserving the no-free-box constraint.
+  env._object_goal_asset_metadata = metadata  # type: ignore[attr-defined]
+  env._object_goal_runtime_context_builder = ObjectGoalRuntimeContextBuilder(  # type: ignore[attr-defined]
+    metadata,
+    device=env.device,
+  )
+  _set_context_tensor(
+    env,
+    "_object_goal_mesh_centroid_offset_local",
+    torch.as_tensor(metadata.mesh_centroid_offset_local, dtype=torch.float32),
+  )
+  _set_context_tensor(
+    env,
+    "_object_goal_object_mesh_vertices_local",
+    torch.as_tensor(metadata.mesh_vertices_local, dtype=torch.float32),
+  )
+  _set_context_tensor(
+    env,
+    "_object_goal_bps_basis",
+    torch.as_tensor(metadata.bps_basis, dtype=torch.float32),
+  )
+  env._object_goal_bps_radius = float(metadata.bps_radius)  # type: ignore[attr-defined]
+  env._object_goal_body_origin_semantics = "original_mesh_origin"  # type: ignore[attr-defined]
+  env._object_goal_sample_window = sample_window  # type: ignore[attr-defined]
+  env._object_goal_final_object_quat_wxyz = sample_window["object_quat_wxyz"][  # type: ignore[attr-defined]
+    :,
+    -1,
+  ]
+
   env._object_goal_context_source = str(input_path)  # type: ignore[attr-defined]
   env._object_goal_context_window = (int(start), int(start) + int(window_size))  # type: ignore[attr-defined]
   env._object_goal_bps_basis_required = True  # type: ignore[attr-defined]
+
+
+@torch.no_grad()
+def object_goal_sample_reset(
+  env: "ManagerBasedRlEnv",
+  env_ids: torch.Tensor | None = None,
+) -> None:
+  """Reset robot/object state and prime the 47D object-goal reward buffer.
+
+  This is intentionally deterministic for the first object-goal integration:
+  it replays one real HF-BPS window, writes its tail frame to sim, and fills the
+  online reward buffer with the full window.  The object body is authored at the
+  original mesh origin, so the body state is offset from the HF-BPS centroid.
+  """
+  if env_ids is None:
+    env_ids = torch.arange(env.num_envs, device=env.device)
+  if env_ids.numel() == 0:
+    return
+  if not hasattr(env, "_object_goal_sample_window"):
+    msg = "object_goal_sample_reset requires load_object_goal_hf_bps_context first"
+    raise RuntimeError(msg)
+  if "object" not in env.scene:
+    msg = "object_goal_sample_reset requires env.scene['object']"
+    raise RuntimeError(msg)
+
+  sample: dict[str, torch.Tensor] = env._object_goal_sample_window  # type: ignore[attr-defined]
+  prior: ObjectGoalTwoStagePrior | None = getattr(env, "_object_goal_prior", None)
+  window_size = int(prior.window_size if prior is not None else sample["root_pos"].shape[1])
+  n = int(env_ids.numel())
+
+  def expand(name: str) -> torch.Tensor:
+    value = sample[name].to(device=env.device, dtype=torch.float32)
+    if value.shape[1] != window_size:
+      value = value[:, :window_size]
+    return value.expand(n, -1, -1).clone()
+
+  root_pos = expand("root_pos")
+  root_quat = expand("root_quat_wxyz")
+  dof_pos = expand("dof_pos")
+  object_centroid = expand("object_centroid")
+  object_quat = expand("object_quat_wxyz")
+
+  origins = env.scene.env_origins[env_ids]
+  robot = env.scene["robot"]
+  root_vel = torch.zeros(n, 6, device=env.device)
+  robot_root_state = torch.cat(
+    [root_pos[:, -1] + origins, root_quat[:, -1], root_vel],
+    dim=-1,
+  )
+  robot.write_root_state_to_sim(robot_root_state, env_ids=env_ids)
+  robot.write_joint_state_to_sim(
+    dof_pos[:, -1],
+    torch.zeros_like(dof_pos[:, -1]),
+    env_ids=env_ids,
+  )
+
+  offset = torch.as_tensor(
+    env._object_goal_mesh_centroid_offset_local,  # type: ignore[attr-defined]
+    dtype=torch.float32,
+    device=env.device,
+  )
+  object_body_pos = mesh_centroid_to_body_pos(
+    object_centroid[:, -1],
+    object_quat[:, -1],
+    offset,
+  )
+  object_root_state = torch.cat(
+    [object_body_pos + origins, object_quat[:, -1], root_vel],
+    dim=-1,
+  )
+  env.scene["object"].write_root_state_to_sim(object_root_state, env_ids=env_ids)
+
+  if not hasattr(env, "_object_goal_buffer"):
+    if prior is None:
+      msg = "object_goal_sample_reset requires env._object_goal_prior before buffer init"
+      raise RuntimeError(msg)
+    env._object_goal_buffer = ObjectGoalMotionBuffer(  # type: ignore[attr-defined]
+      num_envs=env.num_envs,
+      window_size=window_size,
+      g1_diffusion_root=prior.g1_diffusion_root,
+      device=env.device,
+    )
+  buffer: ObjectGoalMotionBuffer = env._object_goal_buffer  # type: ignore[attr-defined]
+  buffer.reset(
+    env_ids,
+    root_pos,
+    root_quat,
+    dof_pos,
+    object_centroid,
+    object_quat,
+  )
 
 
 def init_object_goal_prior(

@@ -6,6 +6,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from smp.rl.object_goal_assets import (
+  ObjectGoalRuntimeContextBuilder,
+  body_pos_to_mesh_centroid,
+)
 from smp.rl.object_goal_features import ObjectGoalMotionBuffer
 from smp.rl.object_goal_prior import DEFAULT_SDS_TIMESTEPS, ObjectGoalTwoStagePrior
 
@@ -63,14 +67,12 @@ def _current_object_pose_from_env(
     )
     raise RuntimeError(msg)
 
-  from mjlab.utils.lab_api.math import quat_apply
-
   obj = env.scene["object"]
   root_pos = obj.data.root_link_pos_w
   quat_w = obj.data.root_link_quat_w
   offset = _env_tensor(env, "_object_goal_mesh_centroid_offset_local")
   offset = _expand_env_batch(offset, env.num_envs)
-  centroid_w = root_pos + quat_apply(quat_w, offset)
+  centroid_w = body_pos_to_mesh_centroid(root_pos, quat_w, offset)
   return centroid_w, quat_w
 
 
@@ -121,20 +123,36 @@ def _prime_or_update_buffer(env: "ManagerBasedRlEnv") -> ObjectGoalMotionBuffer:
   return buffer
 
 
-def _get_object_context(env: "ManagerBasedRlEnv") -> dict[str, torch.Tensor | None]:
-  bps_encoding = _env_tensor(env, "_object_goal_bps_encoding")
-  static_bps = _env_tensor(env, "_object_goal_static_bps_context")
+def _get_object_context(
+  env: "ManagerBasedRlEnv",
+  buffer: ObjectGoalMotionBuffer,
+) -> dict[str, torch.Tensor | None]:
   goal_raw = _env_tensor(env, "_object_goal_final_object_pose_raw")
-  object_verts = (
-    _env_tensor(env, "_object_goal_object_verts")
-    if hasattr(env, "_object_goal_object_verts")
-    else None
-  )
-  object_rotations = (
-    _env_tensor(env, "_object_goal_object_rotations")
-    if hasattr(env, "_object_goal_object_rotations")
-    else None
-  )
+
+  if hasattr(env, "_object_goal_runtime_context_builder"):
+    builder: ObjectGoalRuntimeContextBuilder = env._object_goal_runtime_context_builder  # type: ignore[attr-defined]
+    runtime = builder.build_context_from_centroid_window(
+      buffer.object_centroid_pos,
+      buffer.object_quat_wxyz,
+    )
+    bps_encoding = runtime["bps_encoding"]
+    static_bps = runtime["static_bps_context"]
+    object_verts = runtime["object_verts"]
+    object_rotations = runtime["object_rotations"]
+  else:
+    bps_encoding = _env_tensor(env, "_object_goal_bps_encoding")
+    static_bps = _env_tensor(env, "_object_goal_static_bps_context")
+    object_verts = (
+      _env_tensor(env, "_object_goal_object_verts")
+      if hasattr(env, "_object_goal_object_verts")
+      else None
+    )
+    object_rotations = (
+      _env_tensor(env, "_object_goal_object_rotations")
+      if hasattr(env, "_object_goal_object_rotations")
+      else None
+    )
+
   contact_labels = (
     _env_tensor(env, "_object_goal_contact_labels")
     if hasattr(env, "_object_goal_contact_labels")
@@ -169,7 +187,7 @@ def object_goal_smp_guidance_reward(
   x0_raw = buffer.compute_features()
   object_pose = x0_raw[..., 38:47]
   object_centroid = object_pose[..., :3]
-  context = _get_object_context(env)
+  context = _get_object_context(env, buffer)
 
   normalizer = None
   if normalize:
