@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from smp.rl.object_goal_assets import body_pos_to_mesh_centroid
+from smp.rl.object_goal_events import ensure_object_goal_hf_bps_context
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -53,6 +54,7 @@ def object_goal_position(
   pos_err_scale: float = 8.0,
 ) -> torch.Tensor:
   """``exp(-scale * ||object_centroid - goal_centroid||^2)``."""
+  ensure_object_goal_hf_bps_context(env)
   pos_err = _current_object_centroid_local(env) - _goal_raw(env)[:, :3]
   return torch.exp(-float(pos_err_scale) * (pos_err * pos_err).sum(dim=-1))
 
@@ -62,8 +64,7 @@ def object_goal_orientation(
   ori_err_scale: float = 4.0,
 ) -> torch.Tensor:
   """Quaternion-dot orientation tracking against the HF-BPS final pose."""
-  if not hasattr(env, "_object_goal_final_object_quat_wxyz"):
-    return torch.ones(env.num_envs, device=env.device)
+  ensure_object_goal_hf_bps_context(env)
   obj = env.scene["object"]
   cur = obj.data.root_link_quat_w
   cur = cur / torch.linalg.vector_norm(cur, dim=-1, keepdim=True).clamp_min(1e-8)

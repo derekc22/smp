@@ -151,6 +151,49 @@ def load_object_goal_hf_bps_context(
   env._object_goal_bps_basis_required = True  # type: ignore[attr-defined]
 
 
+def ensure_object_goal_hf_bps_context(env: "ManagerBasedRlEnv") -> None:
+  """Attach real HF-BPS object context before managers probe terms.
+
+  mjlab builds observation/reward managers before startup events run, so terms
+  that need the object-goal centroid offset must be able to initialize the
+  context from the task config.  This helper is intentionally idempotent and
+  loads only HF-BPS metadata/context tensors; it does not load diffusion
+  checkpoints or instantiate any object entity.
+  """
+  if hasattr(env, "_object_goal_mesh_centroid_offset_local"):
+    return
+  if not hasattr(env, "cfg") or "init_object_goal_prior" not in env.cfg.events:
+    msg = (
+      "Object-goal context is missing and env.cfg.events['init_object_goal_prior'] "
+      "is not available to initialize it."
+    )
+    raise RuntimeError(msg)
+
+  params = env.cfg.events["init_object_goal_prior"].params
+  g1_diffusion_root = params.get("g1_diffusion_root", "../g1-diffusion")
+  input_pkl = params.get("hf_bps_context_pkl", "")
+  if not input_pkl:
+    msg = (
+      "Object-goal context is missing and init_object_goal_prior.params does not "
+      "provide 'hf_bps_context_pkl'."
+    )
+    raise RuntimeError(msg)
+  context_start = int(params.get("context_start", 0))
+  window_size = int(
+    params.get(
+      "context_window_size",
+      params.get("window_size", DEFAULT_WINDOW_SIZE),
+    )
+  )
+  load_object_goal_hf_bps_context(
+    env,
+    g1_diffusion_root=g1_diffusion_root,
+    input_pkl=input_pkl,
+    start=context_start,
+    window_size=window_size,
+  )
+
+
 @torch.no_grad()
 def object_goal_sample_reset(
   env: "ManagerBasedRlEnv",
@@ -167,12 +210,15 @@ def object_goal_sample_reset(
     env_ids = torch.arange(env.num_envs, device=env.device)
   if env_ids.numel() == 0:
     return
+  ensure_object_goal_hf_bps_context(env)
   if not hasattr(env, "_object_goal_sample_window"):
     msg = "object_goal_sample_reset requires load_object_goal_hf_bps_context first"
     raise RuntimeError(msg)
-  if "object" not in env.scene:
+  try:
+    obj = env.scene["object"]
+  except KeyError as exc:
     msg = "object_goal_sample_reset requires env.scene['object']"
-    raise RuntimeError(msg)
+    raise RuntimeError(msg) from exc
 
   sample: dict[str, torch.Tensor] = env._object_goal_sample_window  # type: ignore[attr-defined]
   prior: ObjectGoalTwoStagePrior | None = getattr(env, "_object_goal_prior", None)
@@ -219,7 +265,7 @@ def object_goal_sample_reset(
     [object_body_pos + origins, object_quat[:, -1], root_vel],
     dim=-1,
   )
-  env.scene["object"].write_root_state_to_sim(object_root_state, env_ids=env_ids)
+  obj.write_root_state_to_sim(object_root_state, env_ids=env_ids)
 
   if not hasattr(env, "_object_goal_buffer"):
     if prior is None:
@@ -258,6 +304,7 @@ def init_object_goal_prior(
   stage1_fallback_max_contact_correction: float | None = 0.60,
   hf_bps_context_pkl: str = "",
   context_start: int = 0,
+  context_window_size: int | None = None,
 ) -> None:
   """Startup event: load the frozen two-stage object-goal prior onto ``env``."""
   del env_ids
@@ -288,11 +335,11 @@ def init_object_goal_prior(
   env._object_goal_fixed_timesteps = timesteps  # type: ignore[attr-defined]
   env._object_goal_ws = float(ws)  # type: ignore[attr-defined]
 
-  if hf_bps_context_pkl:
+  if hf_bps_context_pkl and not hasattr(env, "_object_goal_mesh_centroid_offset_local"):
     load_object_goal_hf_bps_context(
       env,
       g1_diffusion_root=g1_diffusion_root,
       input_pkl=hf_bps_context_pkl,
       start=context_start,
-      window_size=prior.window_size,
+      window_size=prior.window_size if context_window_size is None else context_window_size,
     )

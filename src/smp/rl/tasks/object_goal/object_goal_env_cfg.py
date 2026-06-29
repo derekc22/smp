@@ -15,6 +15,7 @@ from mjlab.managers.termination_manager import TerminationTermCfg
 from smp.rl.env_cfg import g1_smp_env_cfg
 from smp.rl.object_goal_assets import load_hf_object_asset_metadata
 from smp.rl.object_goal_events import init_object_goal_prior, object_goal_sample_reset
+from smp.rl.object_goal_features import DEFAULT_WINDOW_SIZE
 from smp.rl.object_goal_prior import DEFAULT_SDS_TIMESTEPS
 from smp.rl.object_goal_rewards import object_goal_task_smp_product
 from smp.rl.tasks.object_goal.mdp import (
@@ -91,6 +92,7 @@ def g1_object_goal_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "ws": 6.0,
       "hf_bps_context_pkl": str(DEFAULT_HF_BPS_SAMPLE),
       "context_start": 0,
+      "context_window_size": DEFAULT_WINDOW_SIZE,
     },
   )
   cfg.events["object_goal_sample_reset"] = EventTermCfg(

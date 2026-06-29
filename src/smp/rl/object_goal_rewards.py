@@ -10,6 +10,7 @@ from smp.rl.object_goal_assets import (
   ObjectGoalRuntimeContextBuilder,
   body_pos_to_mesh_centroid,
 )
+from smp.rl.object_goal_events import ensure_object_goal_hf_bps_context
 from smp.rl.object_goal_features import ObjectGoalMotionBuffer
 from smp.rl.object_goal_prior import DEFAULT_SDS_TIMESTEPS, ObjectGoalTwoStagePrior
 
@@ -51,13 +52,15 @@ def _current_object_pose_from_env(
     quat_w = _env_tensor(env, "_object_goal_object_quat_w")
     return centroid_w, quat_w
 
-  if "object" not in env.scene:
+  try:
+    obj = env.scene["object"]
+  except KeyError as exc:
     msg = (
       "Object-goal reward requires a real object entity or explicit "
       "env._object_goal_object_centroid_pos_w/env._object_goal_object_quat_w. "
       "A generic free box is not a valid main integration."
     )
-    raise RuntimeError(msg)
+    raise RuntimeError(msg) from exc
 
   if not hasattr(env, "_object_goal_mesh_centroid_offset_local"):
     msg = (
@@ -67,7 +70,6 @@ def _current_object_pose_from_env(
     )
     raise RuntimeError(msg)
 
-  obj = env.scene["object"]
   root_pos = obj.data.root_link_pos_w
   quat_w = obj.data.root_link_quat_w
   offset = _env_tensor(env, "_object_goal_mesh_centroid_offset_local")
@@ -182,6 +184,7 @@ def object_goal_smp_guidance_reward(
   diagnostic_skip_rectification: bool = False,
 ) -> torch.Tensor:
   """Compute Stage 2 SDS reward after online Stage 1 hand conditioning."""
+  ensure_object_goal_hf_bps_context(env)
   prior: ObjectGoalTwoStagePrior = env._object_goal_prior  # type: ignore[attr-defined]
   buffer = _prime_or_update_buffer(env)
   x0_raw = buffer.compute_features()
@@ -231,6 +234,7 @@ def object_goal_task_smp_product(
   diagnostic_skip_rectification: bool = False,
 ) -> torch.Tensor:
   """``(sum_i w_i task_i(env)) * object_goal_smp``."""
+  ensure_object_goal_hf_bps_context(env)
   task = sum(w * func(env, **kw) for func, w, kw in task_terms)
   return task * object_goal_smp_guidance_reward(
     env,

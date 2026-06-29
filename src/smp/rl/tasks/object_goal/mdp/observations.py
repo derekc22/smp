@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from smp.rl.object_goal_assets import body_pos_to_mesh_centroid
+from smp.rl.object_goal_events import ensure_object_goal_hf_bps_context
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -30,6 +31,7 @@ def object_goal_observation(env: "ManagerBasedRlEnv") -> torch.Tensor:
   MuJoCo/mjlab ``wxyz`` quaternions here; the reward prior converts to g1 rot6d
   inside the object-goal feature builder.
   """
+  ensure_object_goal_hf_bps_context(env)
   obj = env.scene["object"]
   offset = torch.as_tensor(
     env._object_goal_mesh_centroid_offset_local,  # type: ignore[attr-defined]
